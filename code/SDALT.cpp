@@ -142,10 +142,10 @@ int nlm; //number of landmarks
 vector<int> lminds;
 vector<vector<double>> lm;
 double prio(int v,int t){
-    double mret = -1;
+    double mret = 0;
     for (int i = 0; i < nlm;i++)
-        mret = max(mret, abs(lm[v][i] - lm[t][i]));
-    return mret;
+        mret = max(mret, lm[v][i] - lm[t][i]);
+    return max(0.0, mret);
 }
 double SDALTQuery(int s, int t, string regL, bool fixLflag){
     s--, t--;
