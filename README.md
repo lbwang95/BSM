@@ -17,6 +17,16 @@ If the third parameter [regular expression] does not exist, the program will rea
 
 During the execution, the screen will show some auxiliary information, including the time cost for each algorithm in microseconds and the index size in MB. The query answers will be stored in the folder "data/[network]/" with the suffix "-Results" when the program finishes.
 
+### Parameters
+
+To use different networks, we vary the [network]. For example, ./BSM NYC q10 \\(D1\\|C1\\|B1\\|B5\\|A5\\|A1\\|D5\\|C5\\|D3\\|A3\\)*, ./BSM BAY q10 \\(D1\\|C1\\|B1\\|B5\\|A5\\|A1\\|D5\\|C5\\|D3\\|A3\\)*, ...
+
+To test the effect of distances, we simply vary the [query file] from q1 to q10 since they contain queries with increasing distances: ./BSM NYC q1 \\(D1\\|C1\\|B1\\|B5\\|A5\\|A1\\|D5\\|C5\\|D3\\|A3\\)*, ./BSM NYC q2 \\(D1\\|C1\\|B1\\|B5\\|A5\\|A1\\|D5\\|C5\\|D3\\|A3\\)*, ...
+
+To test the effect of regular languages, we vary the number of allowed labels in Exp-2: ./BSM NYC q10 \\(D1\\)*, ./BSM NYC q10 \\(D1\\|C1\\)*, ./BSM NYC q10 \\(D1\\|C1\\|B1\\)*, ...
+
+To test the effect of DFA states, we vary the regular languages as follows: ./BSM NYC q10 D1*, ./BSM NYC q10 D1*C1*, ./BSM NYC q10 D1*C1*B1*, ...
+
 ### Datasets
 
 All the data used in the experiments are stored in the folder "data/". Under it, there is a folder for each network. 
