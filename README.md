@@ -25,7 +25,9 @@ To test the effect of distances, we simply vary the [query file] from q1 to q10 
 
 To test the effect of regular languages, we vary the number of allowed labels in Exp-2: ./BSM NYC q10 \\(D1\\)*, ./BSM NYC q10 \\(D1\\|C1\\)*, ./BSM NYC q10 \\(D1\\|C1\\|B1\\)*, ...
 
-To test the effect of DFA states, we vary the regular languages as follows: ./BSM NYC q10 D1*, ./BSM NYC q10 D1*C1*, ./BSM NYC q10 D1*C1*B1*, ...
+To test the effect of DFA states, we vary the regular languages as follows: ./BSM NYC q10 D1*, ./BSM NYC q10 D1*C1*, ...
+
+Note that the sorted labels from frequent to less frequent ones are D1, C1, B1, B5, A5, A1, D5, C5, D3, A3, C3, B3, D4, D2, C2, A2, B2, B4, A4, C4.
 
 ### Datasets
 
