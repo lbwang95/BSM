@@ -44,7 +44,7 @@ typedef struct node{
     vector<int> children;
     vector<int> X;
 };
-node T[MAX_V];
+vector<node> T;
 
 struct edge{
     int from, to;
@@ -59,20 +59,70 @@ struct edge{
         return id < p.id;
     }
 };
-vector<vector<double>> Lu[MAX_V];//for distances
-vector<double> Lh2h[MAX_V];
+// Distances in the weight calculation index (L and Lu below) are stored as unsigned 32-bit integers
+// in units of 1/lsdscale. lsdscale is the smallest power of 10 that makes all edge weights integers
+// (100 for the four road networks, whose weights have two decimals), so the stored distances are exact.
+typedef uint32_t lsddis;
+const lsddis LSD_INF = 0xFFFFFFFFu;//no path
+double lsdscale = 1;
+lsddis toLSD(double d){
+    if (!(d < DBL_MAX))
+        return LSD_INF;
+    double x = d * lsdscale, r = std::floor(x + 0.5);
+    if (r >= 2147483647.0 || std::fabs(x - r) > 1e-3){
+        printf("Distance %f cannot be stored in the weight calculation index\n", d);
+        exit(1);
+    }
+    return (lsddis)r;
+}
+inline double fromLSD(uint64_t x){//x may be the sum of two stored distances
+    return x >= LSD_INF ? DBL_MAX : x / lsdscale;
+}
+// Label-set distances (L): for vertex v and its ancestor at depth i (i = T[v].depth: v itself), the
+// non-dominated (label set, distance) pairs are Lent[v][Loff[v][i]] ... Lent[v][Loff[v][i + 1] - 1],
+// sorted by distance.
+struct LSDEntry{
+    settype set;
+    lsddis dis;
+};
+vector<vector<LSDEntry>> Lent;
+vector<vector<uint32_t>> Loff;
+// Lu: distances for NLU fixed label sets (columns): 10 single labels (maplabel) and 10 label sets
+// (mapallowlabel). Per vertex, only distinct columns with a finite entry are stored:
+// LuSlot[v * NLU + c] is the stored column of c, or LU_NONE if v reaches no ancestor under column c.
+// Column k of v holds the distances to the ancestors at depths 0 ... T[v].depth in Lu[v][k * (T[v].depth + 1) + i].
+const int NLU = 20;
+const uint8_t LU_NONE = 255;
+vector<vector<lsddis>> Lu;
+vector<uint8_t> LuSlot;
+inline const lsddis *LuCol(int v, int c){
+    uint8_t k = LuSlot[(size_t)v * NLU + c];
+    return k == LU_NONE ? nullptr : &Lu[v][(size_t)k * (T[v].depth + 1)];
+}
+inline double LuAt(int v, int i, int c){
+    const lsddis *col = LuCol(v, c);
+    return col ? fromLSD(col[i]) : DBL_MAX;
+}
+// unconstrained distance from v to its ancestor at depth i: the first (shortest) label-set distance
+inline uint64_t h2hRaw(int v, int i){
+    if (i == T[v].depth)
+        return 0;
+    uint32_t a = Loff[v][i];
+    return a < Loff[v][i + 1] ? Lent[v][a].dis : LSD_INF;
+}
 int maplabel[26];
-vector<IV> L[MAX_V];//supersets
-vector<int> anc[MAX_V];
 int root = -1;
-unordered_map<int, USD> adj[MAX_V];//contains only edges to higher rank
-//unordered_map<int, double> adju[MAX_V];//contains only edges to higher rank
-unordered_map<int,int> adjo[MAX_V], adjT[MAX_V];//contains all the edges
-vector<edge> adjL[MAX_V];
+// label-set distances used while the index is built; released as soon as they are no longer needed
+vector<unordered_map<int, USD>> adj;//contains only edges to higher rank
+vector<unordered_map<int,int>> adjo, adjT;//contains all the edges
+vector<vector<edge>> adjL;
 int allowedLabel[MAX_LS];
 settype allowedLabels;
 int nsym;
-int logn2[1 << 27];
+// index of the single set bit of x, or -1 if x is not a power of two (was a 512 MB lookup table)
+inline int logn2(settype x){
+    return (x > 0 && (x & (x - 1)) == 0) ? __builtin_ctz((unsigned)x) : -1;
+}
 int nlm; //number of landmarks
 vector<int> lminds;
 vector<vector<double>> lm;
@@ -182,7 +232,7 @@ void LSDSPrune(USD &res){
 
 double maxlabelsize, avglabelsize;
 int descnt[MAX_V];
-vector<int> ancarray[MAX_V];//the indices (or depth) for X(v)'s nodes
+vector<vector<int>> ancarray;//the indices (or depth) for X(v)'s nodes
 queue<int> bfs, bfssave, bfsanc;
 void treedec(){
     for (int i = 0; i < N; i++){
@@ -251,6 +301,11 @@ void generateLabel4v(int v){
     }
     int lenanc = anc.size();
     T[v].depth = lenanc;
+    static vector<lsddis> cols;//all NLU columns, before removing duplicates
+    static vector<LSDEntry> ent;
+    cols.assign((size_t)NLU * (lenanc + 1), LSD_INF);
+    ent.clear();
+    Loff[v].resize(lenanc + 2);
     treeavgheight += (double)lenanc;
     treeheight = max(treeheight, lenanc + 1);
     for (int i = 0; i < lenanc;i++){
@@ -274,13 +329,12 @@ void generateLabel4v(int v){
         }
         USD::iterator it;
         vector<SD> tmp;
-        vector<double> tmpm(22, DBL_MAX);
-        double h2hdis = DBL_MAX;
+        vector<double> tmpm(NLU, DBL_MAX);
         for (it = adj[v][u].begin(); it != adj[v][u].end();it++){
             int s1 = it->first;
             double dis = it->second;
             tmp.push_back(SD(s1, dis));
-            int intc = logn2[s1];
+            int intc = logn2(s1);
             if ((intc != -1) && maplabel[intc]){
                 tmpm[maplabel[intc] - 1] = dis;
             }
@@ -289,22 +343,47 @@ void generateLabel4v(int v){
                 if ((s1 & seti1) == s1)
                     tmpm[mapallowlabel[seti1]] = min(tmpm[mapallowlabel[seti1]], dis);
             }
-            h2hdis = min(dis, h2hdis);
         }
         sort(tmp.begin(), tmp.end(), cmpSD);
-        L[v].push_back(make_pair(u, tmp));
-        Lu[v].push_back(tmpm);
-        Lh2h[v].push_back(h2hdis);
+        Loff[v][i] = ent.size();
+        for (int k = 0; k < tmp.size(); k++){
+            LSDEntry e;
+            e.set = tmp[k].first;
+            e.dis = toLSD(tmp[k].second);
+            ent.push_back(e);
+        }
+        for (int c = 0; c < NLU; c++)
+            cols[(size_t)c * (lenanc + 1) + i] = toLSD(tmpm[c]);
         maxlabelsize = max(maxlabelsize, (double)tmp.size());
         avglabelsize += (double)tmp.size();
         //printf("%d %d:\n", v+1,u+1);
         //printSD(tmp);
     }
-    vector<SD> tmp;
-    L[v].push_back(make_pair(v, tmp));
-    vector<double> tmpz(22, 0);
-    Lu[v].push_back(tmpz);
-    Lh2h[v].push_back(0);
+    Loff[v][lenanc] = Loff[v][lenanc + 1] = ent.size();
+    Lent[v].assign(ent.begin(), ent.end());
+    // keep the distinct columns that have a finite entry
+    int nslot = 0, firstc[NLU];
+    for (int c = 0; c < NLU; c++){
+        lsddis *col = &cols[(size_t)c * (lenanc + 1)];
+        col[lenanc] = 0;
+        uint8_t &slot = LuSlot[(size_t)v * NLU + c];
+        slot = LU_NONE;
+        bool finite = false;
+        for (int i = 0; i < lenanc && !finite; i++)
+            finite = (col[i] != LSD_INF);
+        if (!finite)
+            continue;
+        for (int k = 0; k < nslot && slot == LU_NONE; k++)
+            if (memcmp(col, &cols[(size_t)firstc[k] * (lenanc + 1)], sizeof(lsddis) * (lenanc + 1)) == 0)
+                slot = k;
+        if (slot == LU_NONE){
+            firstc[nslot] = c;
+            slot = nslot++;
+        }
+    }
+    Lu[v].resize((size_t)nslot * (lenanc + 1));
+    for (int k = 0; k < nslot; k++)
+        memcpy(&Lu[v][(size_t)k * (lenanc + 1)], &cols[(size_t)firstc[k] * (lenanc + 1)], sizeof(lsddis) * (lenanc + 1));
     ancarray[v].push_back(lenanc);
     totalwidth += T[v].X.size();
 }
@@ -327,23 +406,38 @@ void labeling(){
         mapallowlabel[set2] = mn++;
         rmapallowlabel.push_back(set2);
     }
-    bfs.push(root);
-    int iter = 0;
-    while(!bfs.empty()){
-        int v= bfs.front();
-        bfs.pop();
-        generateLabel4v(v);
-        for (int i = 0; i < T[v].children.size();i++){
-            bfs.push(T[v].children[i]);
+    // Top-down in depth-first order: the labels of v depend only on its ancestors, and adj[v] is read
+    // only while labeling v's subtree, so it is released when the subtree is done. (Any top-down
+    // order gives the same labels.)
+    vector<pair<int, int>> stk;//(vertex, next child)
+    generateLabel4v(root);
+    stk.push_back(make_pair(root, 0));
+    int iter = 1;
+    while(!stk.empty()){
+        int v = stk.back().first, k = stk.back().second;
+        if (k < T[v].children.size()){
+            stk.back().second++;
+            int c = T[v].children[k];
+            generateLabel4v(c);
+            stk.push_back(make_pair(c, 0));
+            if(iter%100000==0)
+                printf("%d %d\n", iter, treeheight);
+            iter += 1;
         }
-        if(iter%100000==0)
-            printf("%d %d\n", iter, treeheight);
-        iter += 1;
+        else{
+            unordered_map<int, USD>().swap(adj[v]);
+            stk.pop_back();
+        }
     }
+    vector<unordered_map<int, USD>>().swap(adj);
+    size_t bl = 0, bu = 0;
+    for (int v = 0; v < N; v++)
+        bl += Lent[v].capacity() * sizeof(LSDEntry) + Loff[v].capacity() * sizeof(uint32_t), bu += Lu[v].capacity() * sizeof(lsddis);
+    printf("Weight calculation index in memory: %.1f MB (label-set distances), %.1f MB (fixed-label-set distances)\n", bl / 1e6, (bu + LuSlot.size()) / 1e6);
 }
 
 
-vector < int > adjt[MAX_V];    // stores the tree
+vector<vector<int>> adjt;    // stores the tree
 vector < int > euler;      // tracks the eulerwalk
 vector < int > depthArr;   // depth for each node corresponding
                            // to eulerwalk
@@ -351,14 +445,16 @@ vector < int > depthArr;   // depth for each node corresponding
 int FAI[2*MAX_V];     // stores first appearance index of every node
 int level[2*MAX_V];   // stores depth for all nodes in the tree
 int ptr;         // pointer to euler walk
-int dp[2*MAX_V][30];  // sparse table
+vector<array<int, 28>> dp;  // sparse table, one row per position of the Euler walk
 int logn[2*MAX_V];    // stores log values
 int p2[30];      // stores power of 2
  
 void buildSparseTable(int n)
 {
     // initializing sparse table
-    memset(dp,-1,sizeof(dp));
+    array<int, 28> none;
+    none.fill(-1);
+    dp.assign(n, none);
  
     // filling base case values
     for (int i=1; i<n; i++)
@@ -367,7 +463,7 @@ void buildSparseTable(int n)
     // dp to fill sparse table
     for (int l=1; l<28; l++)
       for (int i=0; i<n; i++)
-        if (dp[i][l-1]!=-1 && dp[i+p2[l-1]][l-1]!=-1)
+        if (i+p2[l-1] < n && dp[i][l-1]!=-1 && dp[i+p2[l-1]][l-1]!=-1)
           dp[i][l] =
             (depthArr[dp[i][l-1]]>depthArr[dp[i+p2[l-1]][l-1]])?
              dp[i+p2[l-1]][l-1] : dp[i][l-1];
@@ -457,6 +553,26 @@ int LCA(int u,int v)
     // doing RMQ in the required range
     return euler[query(FAI[u], FAI[v])];
 }
+vector<vector<int>> childrenByFAI;//children of each tree node, in Euler-tour order
+void prepareChildSearch(){
+    for (int v = 0; v < N; v++){
+        childrenByFAI[v] = T[v].children;
+        sort(childrenByFAI[v].begin(), childrenByFAI[v].end(), [](int a, int b){ return FAI[a + 1] < FAI[b + 1]; });
+    }
+}
+//the child of l whose subtree contains x (x is a proper descendant of l), found by binary search
+inline int childToward(int l, int x){
+    const vector<int> &ch = childrenByFAI[l];
+    int fx = FAI[x + 1], lo = 0, hi = ch.size() - 1;
+    while (lo < hi){
+        int mid = (lo + hi + 1) / 2;
+        if (FAI[ch[mid] + 1] <= fx)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    return ch[lo];
+}
 void lcamain()
 {
     // constructing the described tree
@@ -494,8 +610,7 @@ typedef struct cp{
     }
 };
 typedef pair<int, cp> CP;
-unordered_map<int, vector<settype>> Lc[MAX_V];
-vector<edge> G[MAX_V];
+vector<unordered_map<int, vector<settype>>> Lc;
 bool ccquery(int s,int t, settype l){
     unordered_map<int, vector<settype>>::iterator it;
     for (it = Lc[s].begin(); it != Lc[s].end();it++){
@@ -513,6 +628,8 @@ bool ccquery(int s,int t, settype l){
     return false;
 }
 
+// Label-constrained reachability labels (P2H). Not used by the queries any more: whether two vertices
+// are connected under a label set is answered with the CC graph, see superComp() and samecc().
 void P2H(){
     for (int i = 0; i < N; i++){
         int v = ordergen[i];
@@ -558,40 +675,38 @@ double h2hQuery(int s, int t, bool flag){
     //printf("-%d %d: %d\n", s + 1, t + 1, l + 1);
     int ind;
     if (l == s){//X(s) is an ancestor of X(t)
-        return Lh2h[t][T[s].depth];
+        return fromLSD(h2hRaw(t, T[s].depth));
     }
     else if (l == t){//X(t) is an ancestor of X(s)
-        return Lh2h[s][T[t].depth];
+        return fromLSD(h2hRaw(s, T[t].depth));
     }
     else{//find the LCA and cs and ct
-        int cs, ct;
-        for (int i = 0; i < T[l].children.size();i++){
-            int tmp = T[l].children[i] + 1;
-            if(LCA(s+1,tmp)==tmp)
-                cs = tmp-1;
-            if(LCA(t+1,tmp)==tmp)
-                ct = tmp-1;
-        }
+        int cs = childToward(l, s), ct = childToward(l, t);
         l = (ancarray[cs].size() < ancarray[ct].size()) ? cs : ct;
         if(ancarray[cs].size()==ancarray[ct].size())
             l = (cs < ct) ? cs : ct;
         //printf("*%d %d %d %d*\n", l + 1, cs+1, ct+1, ancarray[l].size());
+        uint64_t best = UINT64_MAX;
         for (int i = 0; i + 1 < ancarray[l].size(); i++)//iterate over each hoplink
         {
             ind = ancarray[l][i];
-            optw = min(optw, Lh2h[s][ind] + Lh2h[t][ind]);
+            best = min(best, h2hRaw(s, ind) + h2hRaw(t, ind));
         }
+        optw = fromLSD(best);
     }
     return optw;
 }
 
+//shortest distance from u to its ancestor at depth ind using only labels in s (entries are sorted by distance)
+inline uint64_t distRaw(int u, int ind, settype s){
+    const LSDEntry *e = Lent[u].data();
+    for (uint32_t i = Loff[u][ind], end = Loff[u][ind + 1]; i < end; i++)
+        if ((e[i].set & s) == e[i].set)
+            return e[i].dis;
+    return LSD_INF;
+}
 double dist(int u, int ind, settype s){
-    for (int i = 0; i < L[u][ind].second.size(); i++){
-        settype s1 = L[u][ind].second[i].first;
-        if ((s1 & s) == s1)
-            return L[u][ind].second[i].second;
-    }
-    return DBL_MAX;
+    return fromLSD(distRaw(u, ind, s));
 }
 double LSDQuery(int s, int t, int allowedLabels){
     optw = DBL_MAX;
@@ -603,59 +718,57 @@ double LSDQuery(int s, int t, int allowedLabels){
     if(mapallowlabel[allowedLabels]!=-1){
         int lind = mapallowlabel[allowedLabels];
         if (l == s){//X(s) is an ancestor of X(t)
-            return Lu[t][T[s].depth][lind];
+            return LuAt(t, T[s].depth, lind);
         }
         else if (l == t){//X(t) is an ancestor of X(s)
-            return Lu[s][T[t].depth][lind];
+            return LuAt(s, T[t].depth, lind);
         }
         else{//find the LCA and cs and ct
-            int cs, ct;
-            for (int i = 0; i < T[l].children.size();i++){
-                int tmp = T[l].children[i] + 1;
-                if(LCA(s+1,tmp)==tmp)
-                    cs = tmp-1;
-                if(LCA(t+1,tmp)==tmp)
-                    ct = tmp-1;
-            }
+            int cs = childToward(l, s), ct = childToward(l, t);
             l = (ancarray[cs].size() < ancarray[ct].size()) ? cs : ct;
             if(ancarray[cs].size()==ancarray[ct].size())
                 l = (cs < ct) ? cs : ct;
             //printf("*%d %d %d %d*\n", l + 1, cs+1, ct+1, ancarray[l].size());
-            for (int i = 0; i + 1 < ancarray[l].size(); i++)//iterate over each hoplink
+            const lsddis *ps = LuCol(s, lind), *pt = LuCol(t, lind);
+            if (!ps || !pt)
+                return DBL_MAX;
+            const vector<int> &hops = ancarray[l];
+            uint64_t best = UINT64_MAX;
+            for (int i = 0; i + 1 < hops.size(); i++)//iterate over each hoplink
             {
-                ind = ancarray[l][i];
-                optw = min(optw, Lu[s][ind][lind] + Lu[t][ind][lind]);
+                ind = hops[i];
+                best = min(best, (uint64_t)ps[ind] + pt[ind]);
             }
+            optw = fromLSD(best);
         }
         return optw;
     }
-    int intlogall = logn2[allowedLabels];
+    int intlogall = logn2(allowedLabels);
     if((intlogall!=-1)&&maplabel[intlogall]){
         int lind = maplabel[intlogall] - 1;
         if (l == s){//X(s) is an ancestor of X(t)
-            return Lu[t][T[s].depth][lind];
+            return LuAt(t, T[s].depth, lind);
         }
         else if (l == t){//X(t) is an ancestor of X(s)
-            return Lu[s][T[t].depth][lind];
+            return LuAt(s, T[t].depth, lind);
         }
         else{//find the LCA and cs and ct
-            int cs, ct;
-            for (int i = 0; i < T[l].children.size();i++){
-                int tmp = T[l].children[i] + 1;
-                if(LCA(s+1,tmp)==tmp)
-                    cs = tmp-1;
-                if(LCA(t+1,tmp)==tmp)
-                    ct = tmp-1;
-            }
+            int cs = childToward(l, s), ct = childToward(l, t);
             l = (ancarray[cs].size() < ancarray[ct].size()) ? cs : ct;
             if(ancarray[cs].size()==ancarray[ct].size())
                 l = (cs < ct) ? cs : ct;
             //printf("*%d %d %d %d*\n", l + 1, cs+1, ct+1, ancarray[l].size());
-            for (int i = 0; i + 1 < ancarray[l].size(); i++)//iterate over each hoplink
+            const lsddis *ps = LuCol(s, lind), *pt = LuCol(t, lind);
+            if (!ps || !pt)
+                return DBL_MAX;
+            const vector<int> &hops = ancarray[l];
+            uint64_t best = UINT64_MAX;
+            for (int i = 0; i + 1 < hops.size(); i++)//iterate over each hoplink
             {
-                ind = ancarray[l][i];
-                optw = min(optw, Lu[s][ind][lind] + Lu[t][ind][lind]);
+                ind = hops[i];
+                best = min(best, (uint64_t)ps[ind] + pt[ind]);
             }
+            optw = fromLSD(best);
         }
         return optw;
     }
@@ -667,23 +780,18 @@ double LSDQuery(int s, int t, int allowedLabels){
         optw = dist(s, T[t].depth, allowedLabels);
     }
     else{//find the LCA and cs and ct
-        int cs, ct;
-        for (int i = 0; i < T[l].children.size();i++){
-            int tmp = T[l].children[i] + 1;
-            if(LCA(s+1,tmp)==tmp)
-                cs = tmp-1;
-            if(LCA(t+1,tmp)==tmp)
-                ct = tmp-1;
-        }
+        int cs = childToward(l, s), ct = childToward(l, t);
         l = (ancarray[cs].size() < ancarray[ct].size()) ? cs : ct;
         if(ancarray[cs].size()==ancarray[ct].size())
             l = (cs < ct) ? cs : ct;
         //printf("*%d %d %d*\n", l + 1, cs+1, ct+1);
+        uint64_t best = UINT64_MAX;
         for (int i = 0; i + 1 < ancarray[l].size(); i++)//iterate over each hoplink
         {
             ind = ancarray[l][i];
-            optw = min(optw, dist(s, ind, allowedLabels) + dist(t, ind, allowedLabels));
+            best = min(best, distRaw(s, ind, allowedLabels) + distRaw(t, ind, allowedLabels));
         }
+        optw = fromLSD(best);
     }
     //printf("%f\n", optw);
     return optw;
@@ -720,7 +828,7 @@ struct InnerC{
 };
 vector<InnerC> AllInnerC;
 int innerFlag[MAX_V];
-set<int> cutFlag[MAX_V];
+vector<set<int>> cutFlag;
 
 void InitialPruning(){
     memset(innerFlag, -1, sizeof(innerFlag));
@@ -785,11 +893,15 @@ struct CCnode{
     vector<edge> R[MAX_LS];
     set<int> ladj[MAX_LS];
     bool inR[MAX_LS];
+    // R[j] sorted by the grid cell of the border vertex e.from; group g is R[j][gofs[j][g]] ... R[j][gofs[j][g + 1] - 1],
+    // and its landmark intervals are those of group gbase[j] + g (see buildBorderGroups)
+    vector<int> gofs[MAX_LS];
+    size_t gbase[MAX_LS];
     int vn = 0;
 };
 vector<CCnode> CCnodes[MAX_LS];
 int mnccnodes;
-unordered_map<int,int> Nsigma[MAX_V];
+vector<unordered_map<int,int>> Nsigma;
 long long cachesize;
 void save(string filename){
     filename += string("BSMindex");
@@ -879,7 +991,11 @@ void saveLSD(string filename){
     while(!bfssave.empty()){
         int v = bfssave.front();
         bfssave.pop();
-        int lenl1 = L[v].size(), nx = T[v].X.size();
+        int lenl1 = T[v].depth + 1, nx = T[v].X.size();
+        vector<int> ancs(lenl1);//ancestors from the root down to v
+        ancs[lenl1 - 1] = v;
+        for (int i = lenl1 - 2, u = v; i >= 0; i--)
+            ancs[i] = u = T[u].parent;
         LSDindexsize += 4 + nx;
         //fprintf(fp_index, "%d %d %d %d%c", v, T[v].parent, nx, lenl,' ');
         of.write(reinterpret_cast<const char *>(&v), sizeof(int));
@@ -891,14 +1007,15 @@ void saveLSD(string filename){
             of.write(reinterpret_cast<const char *>(&T[v].X[i]), sizeof(int));
         }
         for (int i = 0; i < lenl1; i++){
-            int lend = L[v][i].second.size();
+            int lend = Loff[v][i + 1] - Loff[v][i];
             LSDindexsize += 2 + 2 * lend;
             //fprintf(fp_index, "%d %d ", L[v][i].first, lend);
-            of.write(reinterpret_cast<const char *>(&L[v][i].first), sizeof(int));
+            of.write(reinterpret_cast<const char *>(&ancs[i]), sizeof(int));
             of.write(reinterpret_cast<const char *>(&lend), sizeof(int));
             for (int q = 0; q < lend;q++){
-                of.write(reinterpret_cast<const char *>(&L[v][i].second[q].first), sizeof(int));
-                of.write(reinterpret_cast<const char *>(&L[v][i].second[q].second), sizeof(int));
+                const LSDEntry &e = Lent[v][Loff[v][i] + q];
+                of.write(reinterpret_cast<const char *>(&e.set), sizeof(int));
+                of.write(reinterpret_cast<const char *>(&e.dis), sizeof(int));//in units of 1/lsdscale
             }
         }
         for (int i = 0; i < T[v].children.size();i++){
@@ -1093,17 +1210,26 @@ void Reg2minDFA(string str1){
 }
 
 struct grid{
-    int center;
+    int center = -1;
     vector<int> vert;
     vector<double> vcdis;
     vector<double> cbdis;
 };
-grid grids[450][450];
+// Grid used for the lower bounds below. Both arrays are sized from the
+// network at run time (ngridx * ngridy cells), see main() and preprocesslbdis().
+vector<vector<grid>> grids;//grids[x][y]
 int ngridx, ngridy;
+size_t ngridcells;
 II coords2ind[MAX_V];
 int coords2indInside[MAX_V];
 int mapbor2ind[MAX_V];
-double griddis[2510][2510];
+vector<double> griddis;//distances between grid centres, ngridcells * ngridcells entries
+inline double &griddisAt(int c1, int c2){
+    return griddis[(size_t)c1 * ngridcells + c2];
+}
+inline bool finitedis(double d){
+    return d < DBL_MAX;//false for DBL_MAX, inf and NaN
+}
 
 double priobor(int v,int b){
     int indx = coords2ind[v].first, indy = coords2ind[v].second;
@@ -1111,6 +1237,8 @@ double priobor(int v,int b){
     double d1 = grids[indx][indy].vcdis[indin];
     int indb = mapbor2ind[b];
     double d2 = grids[indx][indy].cbdis[indb];
+    if (!finitedis(d1) || !finitedis(d2))
+        return 0;
     return abs(d2 - d1);
 }
 double gridlb(int v, int u){
@@ -1120,35 +1248,267 @@ double gridlb(int v, int u){
     int indx2 = coords2ind[u].first, indy2 = coords2ind[u].second;
     int indin2 = coords2indInside[u];
     double d2 = grids[indx2][indy2].vcdis[indin2];
-    double d3 = griddis[indx + indy * ngridx][indx2 + indy2 * ngridx];
-    return abs(abs(d3 - d1) - d2);
+    double d3 = griddisAt(indx + indy * ngridx, indx2 + indy2 * ngridx);
+    if (!finitedis(d1) || !finitedis(d2) || !finitedis(d3))
+        return 0;
+    // d1 = d(v, c_v), d2 = d(u, c_u), d3 = d(c_v, c_u). By the triangle inequality,
+    // d(v, u) >= max(d3 - d1 - d2, d1 - d2 - d3, d2 - d1 - d3, 0).
+    double mx = max(d3, max(d1, d2));
+    return max(0.0, mx - ((d1 + d2 + d3) - mx));
 }
 
+// Landmark lower bounds (Section 5, following [22]): unconstrained distances from every vertex to NLM
+// landmarks, chosen by farthest-point selection. |d(x, l) - d(y, l)| <= d(x, y) for every landmark l, and
+// the unconstrained distance is a lower bound of every label-constrained one.
+const int NLM = 32;
+int nland = 0;
+vector<lsddis> lmdis;//lmdis[v * nland + i]: distance from v to landmark i (LSD_INF if unreachable)
+void buildLandmarks(){
+    nland = min(NLM, N);
+    lmdis.assign((size_t)N * nland, LSD_INF);
+    vector<double> d(N), mind(N, DBL_MAX);
+    int l = 0;//first landmark: the vertex farthest from vertex 0, found in the loop below
+    for (int k = -1; k < nland; k++){
+        fill(d.begin(), d.end(), DBL_MAX);
+        priority_queue<DI, vector<DI>, greater<DI>> pq;
+        d[l] = 0;
+        pq.push(DI(0, l));
+        while (!pq.empty()){
+            DI x = pq.top();
+            pq.pop();
+            if (x.first > d[x.second])
+                continue;
+            for (const edge &e : adjL[x.second])
+                if (d[e.to] > x.first + e.weight){
+                    d[e.to] = x.first + e.weight;
+                    pq.push(DI(d[e.to], e.to));
+                }
+        }
+        int far = l;
+        if (k >= 0){
+            for (int v = 0; v < N; v++){
+                lmdis[(size_t)v * nland + k] = toLSD(d[v]);
+                mind[v] = min(mind[v], d[v]);
+            }
+            for (int v = 0; v < N; v++)//unreachable vertices first, then the farthest one
+                if (mind[v] > mind[far])
+                    far = v;
+        }
+        else{
+            for (int v = 0; v < N; v++)
+                if (d[v] < DBL_MAX && d[v] > d[far])
+                    far = v;
+        }
+        l = far;
+    }
+}
+inline double lmlb(int x, int y){
+    const lsddis *a = &lmdis[(size_t)x * nland], *b = &lmdis[(size_t)y * nland];
+    lsddis best = 0;
+    for (int i = 0; i < nland; i++){//branch-free, so that the compiler vectorizes it
+        lsddis x = a[i], y = b[i];
+        lsddis dd = x > y ? x - y : y - x;
+        dd = (x == LSD_INF || y == LSD_INF) ? 0 : dd;
+        best = best > dd ? best : dd;
+    }
+    return best / lsdscale;
+}
+// For every group of border vertices: the smallest and largest distance to each landmark
+vector<lsddis> grpLo, grpHi;
+inline int cellOf(int v){
+    return coords2ind[v].first + coords2ind[v].second * ngridx;
+}
+void buildBorderGroups(){
+    size_t ng = 0;
+    for (int c = 0; c < MAX_LS; c++)
+        for (CCnode &cn : CCnodes[c])
+            for (int j = 0; j < MAX_LS; j++){
+                vector<edge> &R = cn.R[j];
+                cn.gofs[j].clear();
+                cn.gbase[j] = ng;
+                if (R.empty())
+                    continue;
+                stable_sort(R.begin(), R.end(), [](const edge &a, const edge &b){
+                    int ca = cellOf(a.from), cb = cellOf(b.from);
+                    return ca != cb ? ca < cb : a.from < b.from;
+                });
+                for (int k = 0; k < R.size(); k++)
+                    if (k == 0 || cellOf(R[k].from) != cellOf(R[k - 1].from)){
+                        cn.gofs[j].push_back(k);
+                        ng++;
+                    }
+                cn.gofs[j].push_back(R.size());
+            }
+    grpLo.assign(ng * nland, LSD_INF);
+    grpHi.assign(ng * nland, 0);
+    for (int c = 0; c < MAX_LS; c++)
+        for (CCnode &cn : CCnodes[c])
+            for (int j = 0; j < MAX_LS; j++)
+                for (int g = 0; g + 1 < cn.gofs[j].size(); g++){
+                    lsddis *lo = &grpLo[(cn.gbase[j] + g) * nland], *hi = &grpHi[(cn.gbase[j] + g) * nland];
+                    for (int k = cn.gofs[j][g]; k < cn.gofs[j][g + 1]; k++){
+                        const lsddis *a = &lmdis[(size_t)cn.R[j][k].from * nland];
+                        for (int i = 0; i < nland; i++)
+                            lo[i] = min(lo[i], a[i]), hi[i] = max(hi[i], a[i]);//hi[i] == LSD_INF: landmark i is not used
+                    }
+                }
+}
+// lower bound of d(x, u) for every border vertex u of group g
+inline double groupLB(size_t g, int x){
+    const lsddis *lo = &grpLo[g * nland], *hi = &grpHi[g * nland], *a = &lmdis[(size_t)x * nland];
+    lsddis best = 0;
+    for (int i = 0; i < nland; i++){//branch-free, so that the compiler vectorizes it
+        lsddis dx = a[i];
+        lsddis d1 = dx > hi[i] ? dx - hi[i] : 0, d2 = lo[i] > dx ? lo[i] - dx : 0;
+        lsddis dd = d1 > d2 ? d1 : d2;
+        dd = (dx == LSD_INF || hi[i] == LSD_INF) ? 0 : dd;
+        best = best > dd ? best : dd;
+    }
+    return best / lsdscale;
+}
+// priobor(v, .) with the part that depends only on v computed once
+struct BorderLB{
+    const double *row;
+    double d;
+    bool ok;
+    BorderLB(int v){
+        const grid &g = grids[coords2ind[v].first][coords2ind[v].second];
+        d = g.vcdis[coords2indInside[v]];
+        row = g.cbdis.data();
+        ok = finitedis(d);
+    }
+    inline double operator()(int b) const{//same as priobor(v, b)
+        if (!ok)
+            return 0;
+        double d2 = row[mapbor2ind[b]];
+        if (!finitedis(d2))
+            return 0;
+        return abs(d2 - d);
+    }
+};
+// max(grid bound, landmark bound) between the query's source or target x and a border vertex u, computed once per query
+struct EndLB{
+    vector<double> val;
+    vector<unsigned> stamp;
+    unsigned cur = 0;
+    int x = -1;
+    void reset(int _x){
+        x = _x;
+        if (++cur == 0){
+            fill(stamp.begin(), stamp.end(), 0);
+            cur = 1;
+        }
+    }
+    inline double operator()(const BorderLB &g, int u){
+        int k = mapbor2ind[u];
+        if (stamp[k] != cur){
+            stamp[k] = cur;
+            val[k] = max(g(u), lmlb(x, u));
+        }
+        return val[k];
+    }
+};
+EndLB endT, endS;
 double prio(int v,int t){
-    return gridlb(v, t);
+    return max(gridlb(v, t), lmlb(v, t));
     return calculateDistance(v, t);
     double mret = -1;
     for (int i = 0; i < nlm;i++)
         mret = max(mret, abs(lm[v][i] - lm[t][i]));
     return mret;
 }
-double df[MAX_V][MAX_S], db[MAX_V][MAX_S];
+double df[MAX_S][MAX_V], db[MAX_S][MAX_V];//df[q][v], db[q][v]: weights of the vertex-state pair (v, q)
+//vertices whose df or db entries the current query changed, so that rep() resets only those
+vector<int> touchedv;//vertices whose entries may have changed in every state (source and target)
+vector<II> touchedqv;//(state, vertex) entries that may have changed
+inline void touch(int v){
+    touchedv.push_back(v);
+}
+inline void touchq(int q, int v){
+    touchedqv.push_back(II(q, v));
+}
 vector<int> selflabels[MAX_S], outlabels[MAX_S], outlabelsrev[MAX_S];
 settype Lself[MAX_S], Lmove[MAX_S], Lrem[MAX_S], Lremrev[MAX_S];
 bool cmpedge(const edge &e1, const edge &e2){
     return e1.tldis12 < e2.tldis12;
 }
+// The CC nodes reachable from a CC node through CC-graph edges whose labels are in a label set:
+// the result of Algorithm 4's search from any of them. Computed once per label set.
+struct SuperComp{
+    vector<int> of;//of[ccBase[c] + i]: super-component of CC node i of label c, -1 if c is not in the set
+    vector<vector<II>> members;//(label, index) of the CC nodes of each super-component
+};
+int ccBase[MAX_LS + 1];
+unordered_map<settype, SuperComp> superComps;
+const SuperComp &superComp(settype lset){
+    unordered_map<settype, SuperComp>::iterator found = superComps.find(lset);
+    if (found != superComps.end())
+        return found->second;
+    SuperComp &sc = superComps[lset];
+    sc.of.assign(ccBase[MAX_LS], -1);
+    for (int c = 0; c < MAX_LS; c++){
+        if (((lset >> c) & 1) == 0)
+            continue;
+        for (int i = 0; i < CCnodes[c].size(); i++){
+            if (sc.of[ccBase[c] + i] != -1)
+                continue;
+            int id = sc.members.size();
+            sc.members.push_back(vector<II>());
+            vector<II> &m = sc.members.back();
+            sc.of[ccBase[c] + i] = id;
+            m.push_back(II(c, i));
+            for (size_t h = 0; h < m.size(); h++){
+                int c1 = m[h].first, i1 = m[h].second;
+                for (int c2 = 0; c2 < MAX_LS; c2++){
+                    if (c2 == c1 || ((lset >> c2) & 1) == 0)
+                        continue;
+                    for (set<int>::iterator it = CCnodes[c1][i1].ladj[c2].begin(); it != CCnodes[c1][i1].ladj[c2].end(); it++){
+                        if (sc.of[ccBase[c2] + *it] == -1){
+                            sc.of[ccBase[c2] + *it] = id;
+                            m.push_back(II(c2, *it));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return sc;
+}
+// super-component of the CC nodes that contain v, or -1 if v has no incident edge with a label of the set
+inline int superCompOf(const SuperComp &sc, int v, const vector<int> &labels){
+    for (int j = 0; j < labels.size(); j++){
+        unordered_map<int,int>::const_iterator it = Nsigma[v].find(labels[j]);
+        if (it != Nsigma[v].end())
+            return sc.of[ccBase[labels[j]] + it->second];
+    }
+    return -1;
+}
+vector<int> setLabelList(settype lset){
+    vector<int> labels;
+    for (int c = 0; c < MAX_LS; c++)
+        if ((lset >> c) & 1)
+            labels.push_back(c);
+    return labels;
+}
 bool samecc(int s, int t, settype self){
     if(self==0)
         return 0;
-    int i = logn2[self];
+    if (innerFlag[s] != -1 && innerFlag[s] == innerFlag[t] && ((self >> (AllInnerC[innerFlag[s]].label - 'a')) & 1))
+        return true;
+    int i = logn2(self);
     if(i!=-1){
         if (Nsigma[s].count(i) && Nsigma[t].count(i) && Nsigma[s][i] == Nsigma[t][i])
             return true;
         else
             return false;
     }
-    return ccquery(s, t, self);
+    // several labels: s and t are self-connected iff their CC nodes are in the same super-component
+    if (s == t)
+        return true;
+    const SuperComp &sc = superComp(self);
+    vector<int> labels = setLabelList(self);
+    int a = superCompOf(sc, s, labels);
+    return a != -1 && a == superCompOf(sc, t, labels);
 }
 typedef struct pqn{
 	double Aw;
@@ -1165,18 +1525,45 @@ struct cmppqn{
     }
 };
 int DFAq0;
+//visited marks for one expansion of a vertex-state pair (replace two std::set per expansion)
+vector<unsigned> edgeStamp;//edgeStamp[id] == expStamp: edge id is handled
+unsigned expStamp = 0;
+// LSD distance from the expanded vertex to vertex u, computed in the current expansion if lsdStamp[u] == expStamp
+vector<unsigned> lsdStamp;
+vector<double> lsdVal;
+inline double expansionLSD(int v, int u, settype labels){
+    if (lsdStamp[u] != expStamp){
+        lsdStamp[u] = expStamp;
+        lsdVal[u] = LSDQuery(v, u, labels);
+    }
+    return lsdVal[u];
+}
+// Distances are multiples of 1 / lsdscale; a lower bound below a distance by less than half a unit only
+// reflects rounding, so the checks below use this margin.
+inline double lbMargin(){
+    return 0.5 / lsdscale;
+}
+void newExpansion(){
+    if (++expStamp == 0){//wrapped around
+        fill(edgeStamp.begin(), edgeStamp.end(), 0);
+        fill(lsdStamp.begin(), lsdStamp.end(), 0);
+        expStamp = 1;
+    }
+}
+bool bidirectional = true;//false: forward search only, see BSMQuery()
 vector<int> rtrans[MAX_S][26];
 unordered_map<int,int> regadj[MAX_S], regradj[MAX_S];
 double biBFS(int s, int t){
     double ub = DBL_MAX, mu = DBL_MAX;
+    endT.reset(t), endS.reset(s);
     if (finalFlag[DFAq0]){
         if (Lself[DFAq0] != 0 && samecc(s, t, Lself[DFAq0])){
             double dis = LSDQuery(s, t, Lself[DFAq0]);
             if (minDfaStateNum == 1)
                 return dis;
             mu = min(mu, dis);
-            df[t][DFAq0] = min(df[t][DFAq0], mu);
-            db[s][DFAq0] = min(db[s][DFAq0], mu);
+            df[DFAq0][t] = min(df[DFAq0][t], mu);
+            db[DFAq0][s] = min(db[DFAq0][s], mu);
         }
     }
     vector<int> fv[MAX_S], bv[MAX_S];
@@ -1185,218 +1572,216 @@ double biBFS(int s, int t){
     fv[DFAq0].push_back(s);
     for (int i = MAX_S - 1; i >=0 ;i--)
         if(finalFlag[i]){
-            db[t][i] = 0;
-            Qfb.push(pqn(0, t, i, 0));
+            db[i][t] = 0;
+            if (bidirectional)
+                Qfb.push(pqn(0, t, i, 0));
             bv[i].push_back(t);
         }
     double lastqf = 0, lastqb = 0;
-    while (!Qfq.empty()&&!Qfb.empty()){
-        pqn qfu = Qfq.top(), qfb = Qfb.top();
-        Qfq.pop();Qfb.pop();
-        while (!Qfq.empty()&&df[qfu.v][qfu.q] < qfu.w){
-            qfu = Qfq.top();
-            Qfq.pop();
+    while (!Qfq.empty() || !Qfb.empty()){
+        bool has_f = false, has_b = false;
+        pqn qfu(0, 0, 0, 0), qfb(0, 0, 0, 0);
+        if (!Qfq.empty()){
+            qfu = Qfq.top(); Qfq.pop();
+            while (!Qfq.empty() && df[qfu.q][qfu.v] < qfu.w){ qfu = Qfq.top(); Qfq.pop(); }
+            if (df[qfu.q][qfu.v] >= qfu.w) has_f = true;
         }
-        while (!Qfb.empty()&&db[qfb.v][qfb.q] < qfb.w){
-            qfb = Qfb.top();
-            Qfb.pop();
+        if (!Qfb.empty()){
+            qfb = Qfb.top(); Qfb.pop();
+            while (!Qfb.empty() && db[qfb.q][qfb.v] < qfb.w){ qfb = Qfb.top(); Qfb.pop(); }
+            if (db[qfb.q][qfb.v] >= qfb.w) has_b = true;
         }
+        if (!has_f && !has_b) break;
         int v = qfu.v, q = qfu.q;
         int vb = qfb.v, qb = qfb.q;
-        if (q == qb){
+        if (has_f && has_b && q == qb){
             if(Lself[q]!=0 && samecc(v, vb, Lself[q])){
                 double dis = LSDQuery(v, vb, Lself[q]);
-                mu = min(mu, dis + df[v][q] + db[vb][qb]);
-                df[vb][qb] = min(df[vb][qb], df[v][q] + dis);
-                db[v][q] = min(db[v][q], db[vb][qb] + dis);
+                mu = min(mu, dis + df[q][v] + db[qb][vb]);
+                df[qb][vb] = min(df[qb][vb], df[q][v] + dis);
+                db[q][v] = min(db[q][v], db[qb][vb] + dis);
             }
         }
-        if(df[v][q]+prio(v,t)<=mu){
+        if(has_f && df[q][v]+prio(v,t)<=mu){
         //forward
+        if (finalFlag[q] && Lself[q] != 0 && samecc(v, t, Lself[q])){
+            double dis = LSDQuery(v, t, Lself[q]);
+            mu = min(mu, df[q][v] + dis);
+            df[q][t] = min(df[q][t], df[q][v] + dis);
+        }
         bool noborderflag = false;
         if (Lself[q] != 0 && Lmove[q] != 0){
-            queue<II> bfscc;
-            for (int i = 0; i < selflabels[q].size(); i++){
-                int c = selflabels[q][i];
-                if (Nsigma[v].count(c))
-                    bfscc.push(II(c, Nsigma[v][c]));
-            }
-            if(bfscc.size())
-                noborderflag = false;
-            else
-                noborderflag = true;
-            set<int> visited[26];
-            set<int> vis;
-            while (bfscc.size()){
-                int i1 = bfscc.front().first, i2 = bfscc.front().second;
-                bfscc.pop();
-                if(visited[i1].count(i2))
-                    continue;
-                visited[i1].insert(i2);
+            // the CC nodes reachable from v through the labels of Lself(q) (Algorithm 4)
+            const SuperComp &sc = superComp(Lself[q]);
+            int scv = superCompOf(sc, v, selflabels[q]);
+            noborderflag = (scv == -1);
+            newExpansion();
+            BorderLB lbt(t), lbv(v);
+            for (int m = 0; scv != -1 && m < sc.members[scv].size(); m++){
+                int i1 = sc.members[scv][m].first, i2 = sc.members[scv][m].second;
+                const CCnode &cn = CCnodes[i1][i2];
                 for (int j = 0; j < outlabels[q].size(); j++){
-                    int indj = outlabels[q][j], nR = CCnodes[i1][i2].R[indj].size();
-                    for (int k = 0; k < nR; k++){
-                        edge e = CCnodes[i1][i2].R[indj][k];
-                        if(vis.count(e.id))
+                    int indj = outlabels[q][j];
+                    const vector<int> &go = cn.gofs[indj];
+                    for (int g = 0; g + 1 < go.size(); g++){
+                    // the tests below use bounds at least as large for every edge of the group
+                    if (mu < DBL_MAX && df[q][v] + groupLB(cn.gbase[indj] + g, v) + groupLB(cn.gbase[indj] + g, t) > mu)
+                        continue;
+                    for (int k = go[g]; k < go[g + 1]; k++){
+                        const edge &e = cn.R[indj][k];
+                        if(edgeStamp[e.id] == expStamp)
                             continue;
                         int u = e.from;
-                        double ut = priobor(t, u);
-                        if (df[v][q] + priobor(v, u) +  ut> mu)
+                        double ut = endT(lbt, u), vu = lbv(u);
+                        if (df[q][v] + vu + ut > mu)
                             continue;
-                        double dis = LSDQuery(v, u, Lself[q]);
-                        if (df[v][q] + dis + ut > mu)
+                        vu = max(vu, lmlb(v, u));
+                        if (df[q][v] + vu + ut > mu)
+                            continue;
+                        // vu is a lower bound of the super edge v-u (Section 5): if it cannot improve d[u][q],
+                        // the condition below fails, so LSD is not queried
+                        if (u != v && df[q][u] < df[q][v] + vu - lbMargin())
+                            continue;
+                        double dis = expansionLSD(v, u, Lself[q]);
+                        if (df[q][v] + dis + ut > mu)
                             continue;                        
-                        if ((df[u][q] >= df[v][q] + dis) || (dis == 0)){
-                            df[u][q] = df[v][q] + dis;
-                            mu = min(mu, df[u][q] + db[u][q]);
+                        if ((df[q][u] >= df[q][v] + dis) || (dis == 0)){
+                            touchq(q, u);
+                            df[q][u] = df[q][v] + dis;
+                            mu = min(mu, df[q][u] + db[q][u]);
                             int eto = e.to, toq = minDfa.trans[q][e.label - 'a'];
                             if (toq == -1 || toq == q)
                                 continue;
-                            if (df[eto][toq] > df[u][q] + e.weight){
-                                df[eto][toq] = df[u][q] + e.weight;
-                                mu = min(mu, df[eto][toq] + db[eto][toq]);
+                            if (df[toq][eto] > df[q][u] + e.weight){
+                                touchq(toq, eto);
+                                df[toq][eto] = df[q][u] + e.weight;
+                                mu = min(mu, df[toq][eto] + db[toq][eto]);
                                 double lbdis = prio(eto, t);
-                                if (df[eto][toq] + lbdis < mu){
-                                    Qfq.push(pqn(df[eto][toq], eto, toq, df[eto][toq]));
+                                if (df[toq][eto] + lbdis < mu){
+                                    Qfq.push(pqn(df[toq][eto], eto, toq, df[toq][eto]));
                                 }
                             }
                         }
-                        vis.insert(e.id);
+                        edgeStamp[e.id] = expStamp;
                     }
-                }
-                for (int j = 0; j < selflabels[q].size(); j++){
-                    int qj = selflabels[q][j];
-                    if (i1 != qj){
-                        set<int>::iterator it;
-                        for (it = CCnodes[i1][i2].ladj[qj].begin(); it != CCnodes[i1][i2].ladj[qj].end(); it++){
-                            if(visited[qj].count(*it)==0)
-                                bfscc.push(II(qj, *it));
-                        }
                     }
                 }
             }
-            if(noborderflag){
-                if(finalFlag[q]){
-                    double dis = LSDQuery(v, t, Lself[q]);
-                    mu = min(mu, df[v][q] + dis);
-                    df[t][q] = min(df[t][q], df[v][q] + dis);
-                }
-            }        
         }
-        if (Lmove[q] != 0 && Lself[q] == 0){
+        if (Lmove[q] != 0 && (Lself[q] == 0 || noborderflag)){
             int u = v;
             for (int i = 0; i < adjL[u].size();i++){
                 int eto = adjL[u][i].to;
-                edge e = adjL[u][i];
+                const edge &e = adjL[u][i];
                 int toq = minDfa.trans[q][e.label - 'a'];
                 if (toq == -1 || toq == q)
                     continue;
-                if (df[eto][toq] > df[u][q] + e.weight){
-                    df[eto][toq] = df[u][q] + e.weight;
-                    mu = min(mu, df[eto][toq] + db[eto][toq]);
+                if (df[toq][eto] > df[q][u] + e.weight){
+                    touchq(toq, eto);
+                    df[toq][eto] = df[q][u] + e.weight;
+                    mu = min(mu, df[toq][eto] + db[toq][eto]);
                     double lbdis = prio(eto, t);
-                    if (df[eto][toq] + lbdis < mu){
-                        Qfq.push(pqn(df[eto][toq], eto, toq, df[eto][toq]));
+                    if (df[toq][eto] + lbdis < mu){
+                        Qfq.push(pqn(df[toq][eto], eto, toq, df[toq][eto]));
                     }
                 }
             }
         }
         }
-        if (db[vb][qb] + prio(vb, s) <= mu){
+        if (has_b && db[qb][vb] + prio(vb, s) <= mu){
         //backward
+        if (Lself[qb] != 0 && samecc(vb, s, Lself[qb])){
+            if (qb == DFAq0){
+                double dis = LSDQuery(vb, s, Lself[qb]);
+                mu = min(mu, db[qb][vb] + dis);
+                db[qb][s] = min(db[qb][s], db[qb][vb] + dis);
+            } else {
+                if (innerFlag[s] != -1 && vb != s && ((Lself[qb] >> (adje0l[s] - 'a')) & 1)){
+                    double dis = LSDQuery(vb, s, Lself[qb]);
+                    for (int toq : rtrans[qb][adje0l[s] - 'a'])
+                        if (toq != -1 && toq != qb) { db[toq][s] = min(db[toq][s], db[qb][vb] + dis); mu = min(mu, df[toq][s] + db[toq][s]); }
+                }
+            }
+        }
         bool noborderflag = false;
         if (Lself[qb] != 0 && outlabelsrev[qb].size() != 0){
-            queue<II> bfscc;
-            for (int i = 0; i < selflabels[qb].size(); i++){
-                int c = selflabels[qb][i];
-                if (Nsigma[vb].count(c))
-                    bfscc.push(II(c, Nsigma[vb][c]));
-            }
-            if(bfscc.size())
-                noborderflag = false;
-            else
-                noborderflag = true;
-            set<int> visited[MAX_S];
-            set<int> vis;
-            while (bfscc.size()){
-                int i1 = bfscc.front().first, i2 = bfscc.front().second;
-                bfscc.pop();
-                if(visited[i1].count(i2))
-                    continue;
-                visited[i1].insert(i2);
+            // the CC nodes reachable from vb through the labels of Lself(q) (Algorithm 4)
+            const SuperComp &sc = superComp(Lself[qb]);
+            int scv = superCompOf(sc, vb, selflabels[qb]);
+            noborderflag = (scv == -1);
+            newExpansion();
+            BorderLB lbs(s), lbvb(vb);
+            for (int m = 0; scv != -1 && m < sc.members[scv].size(); m++){
+                int i1 = sc.members[scv][m].first, i2 = sc.members[scv][m].second;
+                const CCnode &cn = CCnodes[i1][i2];
                 for (int j = 0; j < outlabelsrev[qb].size(); j++){
-                    int indj = outlabelsrev[qb][j], nR = CCnodes[i1][i2].R[indj].size();
-                    for (int k = 0; k < nR;k++){
-                        edge e = CCnodes[i1][i2].R[indj][k];
-                        if(vis.count(e.id))
+                    int indj = outlabelsrev[qb][j];
+                    const vector<int> &go = cn.gofs[indj];
+                    for (int g = 0; g + 1 < go.size(); g++){
+                    if (mu < DBL_MAX && db[qb][vb] + groupLB(cn.gbase[indj] + g, vb) + groupLB(cn.gbase[indj] + g, s) > mu)
+                        continue;
+                    for (int k = go[g]; k < go[g + 1]; k++){
+                        const edge &e = cn.R[indj][k];
+                        if(edgeStamp[e.id] == expStamp)
                             continue;
                         int eto, u;
                         int b = e.from;
-                        double sb = priobor(s, b);
-                        if (db[vb][qb] + priobor(vb, b) + sb > mu)
+                        double sb = endS(lbs, b), vbb = lbvb(b);
+                        if (db[qb][vb] + vbb + sb > mu)
+                            continue;
+                        if (db[qb][vb] + max(vbb, lmlb(vb, b)) + sb > mu)
                             continue;
                         double latdis = 0;
                         if(((Lself[qb]>>(e.label-'a'))&1))
                             eto = e.from, u = e.to, latdis = abs(sb - e.weight);
                         else
                             eto = e.to, u = e.from, latdis = sb;
-                        double dis = LSDQuery(vb, u, Lself[qb]);
-                        if (db[vb][qb] + dis + latdis > mu)
+                        if (u != vb && db[qb][u] < db[qb][vb] + max(mapbor2ind[u] != -1 ? lbvb(u) : 0.0, lmlb(vb, u)) - lbMargin())
                             continue;
-                        if ((db[u][qb] >= db[vb][qb] + dis) || (dis == 0)){
-                            db[u][qb] = db[vb][qb] + dis;
-                            mu = min(mu, df[u][qb] + db[u][qb]);
+                        double dis = expansionLSD(vb, u, Lself[qb]);
+                        if (db[qb][vb] + dis + latdis > mu)
+                            continue;
+                        if ((db[qb][u] >= db[qb][vb] + dis) || (dis == 0)){
+                            touchq(qb, u);
+                            db[qb][u] = db[qb][vb] + dis;
+                            mu = min(mu, df[qb][u] + db[qb][u]);
                             for (int l = 0; l < rtrans[qb][e.label - 'a'].size();l++){
                                 int toq = rtrans[qb][e.label - 'a'][l];
                                 if (toq == -1 || toq == qb)
                                     continue;
-                                if (db[eto][toq] > db[u][qb] + e.weight){
-                                    db[eto][toq] = db[u][qb] + e.weight;
-                                    mu = min(mu, df[eto][toq] + db[eto][toq]);
+                                if (db[toq][eto] > db[qb][u] + e.weight){
+                                    touchq(toq, eto);
+                                    db[toq][eto] = db[qb][u] + e.weight;
+                                    mu = min(mu, df[toq][eto] + db[toq][eto]);
                                     double lbdis = prio(eto, s);
-                                    if (lbdis + db[eto][toq] < mu){
-                                        Qfb.push(pqn(db[eto][toq], eto, toq, db[eto][toq]));
+                                    if (lbdis + db[toq][eto] < mu){
+                                        Qfb.push(pqn(db[toq][eto], eto, toq, db[toq][eto]));
                                     }
                                 }
                             }
                         }
-                        vis.insert(e.id);
+                        edgeStamp[e.id] = expStamp;
                     }
-                }
-                for (int j = 0; j < selflabels[qb].size(); j++){
-                    int qj = selflabels[qb][j];
-                    if (i1 != qj){
-                        set<int>::iterator it;
-                        for (it = CCnodes[i1][i2].ladj[qj].begin(); it != CCnodes[i1][i2].ladj[qj].end(); it++){
-                            if(visited[qj].count(*it)==0)
-                                bfscc.push(II(qj, *it));
-                        }
                     }
                 }
             }
-            if(noborderflag){
-                if(qb==DFAq0){
-                    double dis = LSDQuery(vb, s, Lself[qb]);
-                    mu = min(mu, db[vb][qb] + dis);
-                    db[s][qb] = min(db[s][qb], db[vb][qb] + dis);
-                }
-            }        
         }
-        if (outlabelsrev[qb].size() != 0 && Lself[qb] == 0){
+        if (outlabelsrev[qb].size() != 0 && (Lself[qb] == 0 || noborderflag)){
             int u = vb;
             for (int i = 0; i < adjL[u].size();i++){
                 int eto = adjL[u][i].to;
-                edge e = adjL[u][i];
+                const edge &e = adjL[u][i];
                 for (int l = 0; l < rtrans[qb][e.label - 'a'].size();l++){
                     int toq = rtrans[qb][e.label - 'a'][l];
                     if (toq == -1 || toq == qb)
                         continue;
-                    if (db[eto][toq] > db[u][qb] + e.weight){
-                        db[eto][toq] = db[u][qb] + e.weight;
-                        mu = min(mu, df[eto][toq] + db[eto][toq]);
+                    if (db[toq][eto] > db[qb][u] + e.weight){
+                        touchq(toq, eto);
+                        db[toq][eto] = db[qb][u] + e.weight;
+                        mu = min(mu, df[toq][eto] + db[toq][eto]);
                         double lbdis = prio(eto, s);
-                        if (lbdis + db[eto][toq] < mu){
-                            Qfb.push(pqn(db[eto][toq], eto, toq, db[eto][toq]));
+                        if (lbdis + db[toq][eto] < mu){
+                            Qfb.push(pqn(db[toq][eto], eto, toq, db[toq][eto]));
                         }
                     }
                 }
@@ -1404,8 +1789,9 @@ double biBFS(int s, int t){
         }
         }
 
-        if (df[v][q] + db[vb][qb] >= mu)
-            return mu;
+        if (has_f && has_b && df[q][v] + db[qb][vb] >= mu) return mu;
+        if (has_f && !has_b && df[q][v] >= mu) return mu;
+        if (!has_f && has_b && db[qb][vb] >= mu) return mu;
     }
 
     if(mu==DBL_MAX)
@@ -1457,10 +1843,26 @@ double BSMQuery(int s, int t, string regL, bool fixLflag){
                 Lrem[i] = Lremrev[i] = Lself[i];
             }
         }
+        // The backward search finds the vertex x of a transition (x, p) -l-> (u, qb) with
+        // l in Lself(qb) only through the edges stored in the CC graph, which do not start
+        // at inner (single-label) vertices. If p can itself be entered by an l-edge, x can be
+        // such a vertex, e.g. for A1A1A1* or (A1A2)*A1*. For these DFAs we search forward only,
+        // as in Algorithm 5. No language of the paper's experiments has this property.
+        bidirectional = true;
+        for (int qb = 0; qb < MAX_S; qb++)
+            for (int j = 0; j < selflabels[qb].size(); j++){
+                int l = selflabels[qb][j];
+                for (int k = 0; k < rtrans[qb][l].size(); k++){
+                    int p = rtrans[qb][l][k];
+                    if (p != qb && rtrans[p][l].size())
+                        bidirectional = false;
+                }
+            }
     }
     if (s == t)
         return 0;
-    df[s][DFAq0] = 0;
+    touch(s), touch(t);
+    df[DFAq0][s] = 0;
     return biBFS(s, t);
 }
 
@@ -1490,12 +1892,23 @@ void rep(string qi, string sfile, string &setres, string reg, bool fixflag){
     fclose(fp_query);
     int qn = queryset.size();
     double runT = 0;
-    for (int i = 0; i < qn; i++){
+    for (int j = 0; j < MAX_S;j++){
         for (int ki = 0; ki <= N;ki++){
+            df[j][ki] = db[j][ki] = DBL_MAX;
+        }
+    }
+    touchedv.clear(), touchedqv.clear();
+    for (int i = 0; i < qn; i++){
+        //reset what the previous query changed
+        for (int k = 0; k < touchedv.size(); k++){
+            int ki = touchedv[k];
             for (int j = 0; j < MAX_S;j++){
-                df[ki][j] = db[ki][j] = DBL_MAX;
+                df[j][ki] = db[j][ki] = DBL_MAX;
             }
         }
+        for (int k = 0; k < touchedqv.size(); k++)
+            df[touchedqv[k].first][touchedqv[k].second] = db[touchedqv[k].first][touchedqv[k].second] = DBL_MAX;
+        touchedv.clear(), touchedqv.clear();
         double tmp;
         if(fixflag){
             t1=std::chrono::high_resolution_clock::now();
@@ -1551,6 +1964,7 @@ void preprocesslbdis(){
             if(grids[i][j].vert.size()==0)
                 continue;
             int cent = grids[i][j].center;
+            grids[i][j].cbdis.reserve(nbor);
             for (int v = 0;v<N;v++){
                 if(innerFlag[v]==-1){
                     grids[i][j].cbdis.push_back(h2hQuery(cent, v, 0));
@@ -1559,6 +1973,11 @@ void preprocesslbdis(){
         }
     }
 
+    ngridcells = (size_t)ngridx * ngridy;
+    endT.val.assign(nbor, 0), endT.stamp.assign(nbor, 0);
+    endS.val.assign(nbor, 0), endS.stamp.assign(nbor, 0);
+    printf("griddis: %zu x %zu entries, %.1f MB\n", ngridcells, ngridcells, (double)ngridcells * ngridcells * sizeof(double) / 1000000);
+    griddis.assign(ngridcells * ngridcells, 0);
     for (int i = 0; i < ngridx;i++){
         for (int j = 0; j < ngridy;j++){
             if(grids[i][j].vert.size()==0)
@@ -1569,7 +1988,7 @@ void preprocesslbdis(){
                     if(grids[i1][j1].vert.size()==0)
                         continue;
                     int cent1 = grids[i1][j1].center;
-                    griddis[i + j * ngridx][i1 + j1 * ngridx] = h2hQuery(cent, cent1, 0);
+                    griddisAt(i + j * ngridx, i1 + j1 * ngridx) = h2hQuery(cent, cent1, 0);
                 }
             }
         }
@@ -1606,6 +2025,14 @@ int main(int argc , char * argv[]){
     for (int i = 0; i < 4; i++)
         fgetc(fp_network);
     fscanf(fp_network, "%d%d", &N, &M);
+    if (N + 2 > MAX_V){
+        printf("The network has %d vertices; MAX_V must be at least %d\n", N, N + 2);
+        return 1;
+    }
+    T.resize(N + 2), adj.resize(N + 2), adjo.resize(N + 2), adjT.resize(N + 2), adjL.resize(N + 2);
+    ancarray.resize(N + 2), adjt.resize(N + 2), childrenByFAI.resize(N + 2), Lc.resize(N + 2);
+    cutFlag.resize(N + 2), Nsigma.resize(N + 2), Lent.resize(N + 2), Loff.resize(N + 2), Lu.resize(N + 2);
+    LuSlot.assign((size_t)(N + 2) * NLU, LU_NONE);
     for (int i = 0; i < 3; i++)
         fgets(buffer, 90, fp_network);
     for (int i = 0; i < M; i++) {
@@ -1626,6 +2053,21 @@ int main(int argc , char * argv[]){
             alledges.push_back(edge(u, v, w, l));
             cntlabel[l - 'a']++;
         }
+    }
+    // unit of the distances stored in the weight calculation index: the smallest power of 10 that
+    // makes all edge weights integers
+    for (lsdscale = 1; lsdscale <= 1e6; lsdscale *= 10){
+        bool ok = true;
+        for (int i = 0; i < alledges.size() && ok; i++){
+            double x = alledges[i].weight * lsdscale;
+            ok = (alledges[i].weight >= 0 && std::fabs(x - std::floor(x + 0.5)) <= 1e-6 * max(1.0, x));
+        }
+        if (ok)
+            break;
+    }
+    if (lsdscale > 1e6){
+        printf("Edge weights must be non-negative with at most 6 decimals\n");
+        return 1;
     }
     double minx = DBL_MAX, miny = DBL_MAX, maxx = -DBL_MAX, maxy = -DBL_MAX;
     if(1){
@@ -1648,18 +2090,33 @@ int main(int argc , char * argv[]){
     printf("%f %f %f %f\n", minx, maxx, miny, maxy);
 
     memset(coords2indInside, -1, sizeof(coords2indInside));
-    double lengrid = 0.02; // 0.005
+    // Side length of a grid cell in degrees. The default 0.02 gives 50 x 50 cells on NYC.
+    // griddis needs (#cells)^2 doubles, so larger networks need a larger cell size,
+    // which can be given as the optional fourth argument.
+    double lengrid = 0.02;
+    if (argc > 4)
+        lengrid = atof(argv[4]);
+    if (!(lengrid > 0)){
+        printf("Invalid grid cell size %s\n", argv[4]);
+        return 1;
+    }
+    ngridx = ngridy = 0;
     for (int i = 0; i < N; i++) {
         double x = coords[i].first, y = coords[i].second;
         int indx = (x - minx) / lengrid, indy = (y - miny) / lengrid;
-        grids[indx][indy].vert.push_back(i);
-        coords2indInside[i] = grids[indx][indy].vert.size() - 1;
-        grids[indx][indy].center = i;
         coords2ind[i] = II(indx, indy);
         ngridx = max(ngridx, indx);
         ngridy = max(ngridy, indy);
     }
     ngridx++, ngridy++;
+    printf("Grid: %d x %d cells of size %g\n", ngridx, ngridy, lengrid);
+    grids.assign(ngridx, vector<grid>(ngridy));
+    for (int i = 0; i < N; i++) {
+        int indx = coords2ind[i].first, indy = coords2ind[i].second;
+        grids[indx][indy].vert.push_back(i);
+        coords2indInside[i] = grids[indx][indy].vert.size() - 1;
+        grids[indx][indy].center = i;
+    }
 
     std::chrono::high_resolution_clock::time_point t1, t2;
 	std::chrono::duration<double> time_span;
@@ -1706,13 +2163,6 @@ int main(int argc , char * argv[]){
         pql.pop();
     }
 
-    memset(logn2, -1, sizeof(logn2));
-    logn2[1] = 0;
-    int val = 1;
-    for (int i = 0; i < 27;i++){
-        logn2[val] = i;
-        val *= 2;
-    }
 
     t1 = std::chrono::high_resolution_clock::now();
     InitialPruning();
@@ -1724,6 +2174,12 @@ int main(int argc , char * argv[]){
 
     t1 = std::chrono::high_resolution_clock::now();
     CCGraphConstruction();
+    ccBase[0] = 0;
+    for (int c = 0; c < MAX_LS; c++)
+        ccBase[c + 1] = ccBase[c] + CCnodes[c].size();
+    edgeStamp.assign(M + 2, 0);
+    lsdStamp.assign(N + 2, 0);
+    lsdVal.assign(N + 2, 0);
     t2=std::chrono::high_resolution_clock::now();
     time_span = std::chrono::duration_cast<std::chrono::duration<double>>(t2-t1);
 	runT= time_span.count();
@@ -1741,16 +2197,11 @@ int main(int argc , char * argv[]){
     setres += string("Saving Time ") + to_string(runT) + string("\n");
     setres += string("Index Size ") + to_string((double)indexsize * 4 / 1000000) + string("MB\n");
 
-    t1=std::chrono::high_resolution_clock::now();
-    P2H();
-    t2=std::chrono::high_resolution_clock::now();
-    time_span = std::chrono::duration_cast<std::chrono::duration<double>>(t2-t1);
-	runT= time_span.count();
-	cout<<"P2H Time "<<runT<<endl;
-    setres += string("P2H Time ") + to_string(runT)+ string("\n");
 
     t1=std::chrono::high_resolution_clock::now();
     treedec();
+    vector<unordered_map<int,int>>().swap(adjT);//only used to build the tree decomposition
+    vector<unordered_map<int,int>>().swap(adjo);
     t2=std::chrono::high_resolution_clock::now();
     time_span = std::chrono::duration_cast<std::chrono::duration<double>>(t2-t1);
 	runT= time_span.count();
@@ -1759,6 +2210,7 @@ int main(int argc , char * argv[]){
     setres += string("Tree Decomposition Time ") + to_string(runT)+ string("\n");
 
     lcamain();
+    prepareChildSearch();
 
     t1=std::chrono::high_resolution_clock::now();
     labeling();
@@ -1775,6 +2227,8 @@ int main(int argc , char * argv[]){
     setres += string("Avg. Label Size ") + to_string((double)avglabelsize / treeavgheight) + string("\n");
 
     t1=std::chrono::high_resolution_clock::now();
+    buildLandmarks();
+    buildBorderGroups();
     preprocesslbdis();
     t2=std::chrono::high_resolution_clock::now();
     time_span = std::chrono::duration_cast<std::chrono::duration<double>>(t2-t1);
@@ -1806,4 +2260,4 @@ int main(int argc , char * argv[]){
     fprintf(fp_record, "%s\n", setres.c_str());
     fclose(fp_record);
     return 0;
-}
+}
